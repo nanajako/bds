@@ -1,0 +1,2380 @@
+<script type="module">
+import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm";
+
+/* =========================================================
+   BADIA SPICES GHANA
+   SUPABASE CLOUD FLEET & COMMUNICATION SYSTEM
+   ========================================================= */
+
+const SUPABASE_URL = "https://svlzlkutlysfscveytcl.supabase.co";
+
+const SUPABASE_ANON_KEY =
+    "sb_publishable_4FoG_HAkeBZCDknXwhxrS_g_qbqXTCYv";
+
+const supabase = createClient(
+    SUPABASE_URL,
+    SUPABASE_ANON_KEY
+);
+
+/* =========================================================
+   GLOBAL STATE
+   ========================================================= */
+
+let supabaseUser = null;
+
+let ridersChannel = null;
+let ordersChannel = null;
+let messagesChannel = null;
+
+let leafletMap = null;
+let leafletMarkers = {};
+
+let gpsWatchId = null;
+
+let mediaRecorder = null;
+let audioChunks = [];
+let isRecordingPTT = false;
+
+const appState = {
+    currentUser: null,
+    authMode: "rider",
+
+    activeRiderTab: "chat",
+
+    ridersOnline: [],
+    orders: [],
+
+    chatMessages: [],
+
+    selectedRiderId: null,
+    selectedRiderName: ""
+};
+
+
+/* =========================================================
+   UTILITY FUNCTIONS
+   ========================================================= */
+
+function escapeHtml(value) {
+    return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+}
+
+function escapeJs(value) {
+    return String(value ?? "")
+        .replace(/\\/g, "\\\\")
+        .replace(/'/g, "\\'")
+        .replace(/\n/g, "\\n")
+        .replace(/\r/g, "\\r");
+}
+
+function createId() {
+    if (window.crypto && crypto.randomUUID) {
+        return crypto.randomUUID();
+    }
+
+    return Date.now().toString(36) + Math.random().toString(36).slice(2);
+}
+
+function formatMessageTime(dateValue) {
+    if (!dateValue) return "";
+
+    const date = new Date(dateValue);
+
+    if (Number.isNaN(date.getTime())) return "";
+
+    return date.toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit"
+    });
+}
+
+function showToast(message, type = "info") {
+    let toast = document.getElementById("badia-toast");
+
+    if (!toast) {
+        toast = document.createElement("div");
+        toast.id = "badia-toast";
+
+        toast.className =
+            "fixed bottom-5 left-1/2 -translate-x-1/2 z-[9999] px-5 py-3 rounded-xl shadow-2xl text-sm font-semibold max-w-[90%] text-center";
+
+        document.body.appendChild(toast);
+    }
+
+    toast.textContent = message;
+
+    toast.classList.remove(
+        "bg-green-600",
+        "bg-red-600",
+        "bg-slate-800"
+    );
+
+    if (type === "success") {
+        toast.classList.add("bg-green-600");
+    } else if (type === "error") {
+        toast.classList.add("bg-red-600");
+    } else {
+        toast.classList.add("bg-slate-800");
+    }
+
+    clearTimeout(toast._timer);
+
+    toast._timer = setTimeout(() => {
+        toast.remove();
+    }, 3500);
+}
+
+
+/* =========================================================
+   CONNECTION STATUS
+   ========================================================= */
+
+function setSyncBadge(online, message = "") {
+    const possibleIds = [
+        "connection-status",
+        "cloud-status",
+        "sync-status"
+    ];
+
+    let element = null;
+
+    for (const id of possibleIds) {
+        const found = document.getElementById(id);
+
+        if (found) {
+            element = found;
+            break;
+        }
+    }
+
+    if (!element) return;
+
+    if (online) {
+        element.innerHTML =
+            `<i class="fa-solid fa-cloud text-green-400 mr-1"></i> Supabase Realtime Online`;
+    } else {
+        element.innerHTML =
+            `<i class="fa-solid fa-cloud-slash text-red-400 mr-1"></i> ${escapeHtml(message || "Offline")}`;
+    }
+}
+
+
+/* =========================================================
+   SUPABASE AUTHENTICATION
+   ========================================================= */
+
+async function initSupabase() {
+    const {
+        data: {
+            session
+        }
+    } = await supabase.auth.getSession();
+
+    if (session?.user) {
+        supabaseUser = session.user;
+        return;
+    }
+
+    const {
+        data,
+        error
+    } = await supabase.auth.signInAnonymously();
+
+    if (error) {
+        console.error("Anonymous authentication error:", error);
+
+        throw new Error(
+            "Supabase Anonymous Sign-In is not enabled. " +
+            "Open Supabase → Authentication → Providers and enable Anonymous Sign-Ins."
+        );
+    }
+
+    supabaseUser = data.user;
+}
+
+
+/* =========================================================
+   DATABASE MAPPING
+   ========================================================= */
+
+function mapRider(row) {
+    return {
+        id: row.id,
+        name: row.name || "",
+        phone: row.phone || "",
+        status: row.status || "Active Shift",
+
+        loginTime: row.login_time || null,
+        logoutTime: row.logout_time || null,
+
+        lat: row.lat ?? null,
+        lng: row.lng ?? null,
+
+        lastSeen: row.last_seen || null
+    };
+}
+
+function mapOrder(row) {
+    return {
+        id: row.id,
+        customer: row.customer || "",
+        qty: row.qty || "",
+        rider: row.rider || "",
+        time: row.time || "",
+        status: row.status || "Dispatched",
+        created_at: row.created_at || null
+    };
+}
+
+
+/* =========================================================
+   LOAD RIDERS
+   ========================================================= */
+
+async function loadRiders() {
+    const {
+        data,
+        error
+    } = await supabase
+        .from("riders")
+        .select("*")
+        .order("name", {
+            ascending: true
+        });
+
+    if (error) {
+        console.error("Load riders error:", error);
+        showToast("Unable to load riders from Supabase.", "error");
+        return;
+    }
+
+    appState.ridersOnline = (data || []).map(mapRider);
+
+    refreshUI();
+}
+
+
+/* =========================================================
+   LOAD ORDERS
+   ========================================================= */
+
+async function loadOrders() {
+    const {
+        data,
+        error
+    } = await supabase
+        .from("orders")
+        .select("*")
+        .order("created_at", {
+            ascending: false
+        });
+
+    if (error) {
+        console.error("Load orders error:", error);
+        showToast("Unable to load orders from Supabase.", "error");
+        return;
+    }
+
+    appState.orders = (data || []).map(mapOrder);
+
+    refreshUI();
+}
+
+
+/* =========================================================
+   REALTIME RIDERS
+   ========================================================= */
+
+function subscribeToRiders() {
+    if (ridersChannel) {
+        supabase.removeChannel(ridersChannel);
+    }
+
+    ridersChannel = supabase
+        .channel("badia-riders-live")
+        .on(
+            "postgres_changes",
+            {
+                event: "*",
+                schema: "public",
+                table: "riders"
+            },
+            payload => {
+
+                if (payload.eventType === "DELETE") {
+
+                    appState.ridersOnline =
+                        appState.ridersOnline.filter(
+                            rider => rider.id !== payload.old.id
+                        );
+
+                } else {
+
+                    const rider = mapRider(payload.new);
+
+                    const existingIndex =
+                        appState.ridersOnline.findIndex(
+                            item => item.id === rider.id
+                        );
+
+                    if (existingIndex >= 0) {
+                        appState.ridersOnline[existingIndex] = rider;
+                    } else {
+                        appState.ridersOnline.push(rider);
+                    }
+                }
+
+                refreshUI();
+
+                updateLeafletMarkers();
+            }
+        )
+        .subscribe(status => {
+
+            if (status === "SUBSCRIBED") {
+                setSyncBadge(true);
+            }
+        });
+}
+
+
+/* =========================================================
+   REALTIME ORDERS
+   ========================================================= */
+
+function subscribeToOrders() {
+    if (ordersChannel) {
+        supabase.removeChannel(ordersChannel);
+    }
+
+    ordersChannel = supabase
+        .channel("badia-orders-live")
+        .on(
+            "postgres_changes",
+            {
+                event: "*",
+                schema: "public",
+                table: "orders"
+            },
+            payload => {
+
+                if (payload.eventType === "DELETE") {
+
+                    appState.orders =
+                        appState.orders.filter(
+                            order => order.id !== payload.old.id
+                        );
+
+                } else {
+
+                    const order = mapOrder(payload.new);
+
+                    const existingIndex =
+                        appState.orders.findIndex(
+                            item => item.id === order.id
+                        );
+
+                    if (existingIndex >= 0) {
+                        appState.orders[existingIndex] = order;
+                    } else {
+                        appState.orders.unshift(order);
+                    }
+                }
+
+                refreshUI();
+            }
+        )
+        .subscribe();
+}
+
+
+/* =========================================================
+   RIDER LOGIN
+   ========================================================= */
+
+window.handleRiderLogin = async function () {
+
+    const nameInput = document.getElementById("rider-name");
+    const phoneInput = document.getElementById("rider-phone");
+
+    const name = nameInput?.value.trim();
+    const phone = phoneInput?.value.trim();
+
+    if (!name || !phone) {
+        showToast(
+            "Please enter the rider's full name and phone number.",
+            "error"
+        );
+        return;
+    }
+
+    if (!supabaseUser) {
+        showToast(
+            "Cloud connection is not ready yet.",
+            "error"
+        );
+        return;
+    }
+
+    const riderId = supabaseUser.id;
+
+    const riderData = {
+        id: riderId,
+        name,
+        phone,
+
+        status: "Active Shift",
+
+        login_time: new Date().toISOString(),
+        logout_time: null,
+
+        last_seen: new Date().toISOString(),
+
+        lat: null,
+        lng: null
+    };
+
+    const {
+        error
+    } = await supabase
+        .from("riders")
+        .upsert(riderData, {
+            onConflict: "id"
+        });
+
+    if (error) {
+        console.error("Rider login error:", error);
+
+        showToast(
+            "Rider login failed: " + error.message,
+            "error"
+        );
+
+        return;
+    }
+
+    appState.currentUser = {
+        role: "rider",
+        id: riderId,
+        name,
+        phone
+    };
+
+    appState.selectedRiderId = riderId;
+    appState.selectedRiderName = name;
+
+    await subscribeToMessages(riderId);
+
+    startRiderGPS();
+
+    showView("rider-portal");
+
+    updateHeaderNav();
+
+    showToast(
+        `Welcome ${name}. You are connected to Dispatch.`,
+        "success"
+    );
+
+    refreshUI();
+};
+
+
+/* =========================================================
+   ADMIN LOGIN
+   ========================================================= */
+
+window.handleAdminLogin = async function () {
+
+    const passcodeInput =
+        document.getElementById("admin-passcode");
+
+    const passcode =
+        passcodeInput?.value.trim();
+
+    if (passcode !== "badia2026") {
+        showToast(
+            "Incorrect admin passcode.",
+            "error"
+        );
+        return;
+    }
+
+    appState.currentUser = {
+        role: "admin",
+        id: supabaseUser?.id || "admin",
+        name: "Dispatch Admin"
+    };
+
+    showView("admin-portal");
+
+    updateHeaderNav();
+
+    await loadRiders();
+    await loadOrders();
+
+    if (appState.ridersOnline.length > 0) {
+
+        const firstRider =
+            appState.ridersOnline.find(
+                rider => rider.status !== "Shift Ended"
+            ) || appState.ridersOnline[0];
+
+        await selectAdminRider(firstRider.id);
+    }
+
+    initLeafletMap();
+
+    showToast(
+        "Admin command connected to Supabase.",
+        "success"
+    );
+
+    refreshUI();
+};
+
+
+/* =========================================================
+   VIEW SWITCHING
+   ========================================================= */
+
+function showView(viewName) {
+
+    const authScreen =
+        document.getElementById("auth-screen");
+
+    const riderPortal =
+        document.getElementById("view-rider-portal");
+
+    const adminPortal =
+        document.getElementById("view-admin-portal");
+
+    if (authScreen) {
+        authScreen.classList.add("hidden");
+    }
+
+    if (riderPortal) {
+        riderPortal.classList.add("hidden");
+    }
+
+    if (adminPortal) {
+        adminPortal.classList.add("hidden");
+    }
+
+    if (viewName === "auth") {
+        authScreen?.classList.remove("hidden");
+    }
+
+    if (viewName === "rider-portal") {
+        riderPortal?.classList.remove("hidden");
+    }
+
+    if (viewName === "admin-portal") {
+        adminPortal?.classList.remove("hidden");
+    }
+}
+
+
+/* =========================================================
+   LOGOUT
+   ========================================================= */
+
+window.handleLogout = async function () {
+
+    const role =
+        appState.currentUser?.role;
+
+    if (role === "rider" && supabaseUser) {
+
+        await supabase
+            .from("riders")
+            .update({
+                status: "Shift Ended",
+                logout_time: new Date().toISOString(),
+                last_seen: new Date().toISOString()
+            })
+            .eq("id", supabaseUser.id);
+
+        if (gpsWatchId !== null) {
+            navigator.geolocation.clearWatch(gpsWatchId);
+            gpsWatchId = null;
+        }
+    }
+
+    if (messagesChannel) {
+        await supabase.removeChannel(messagesChannel);
+        messagesChannel = null;
+    }
+
+    appState.currentUser = null;
+    appState.selectedRiderId = null;
+    appState.selectedRiderName = "";
+    appState.chatMessages = [];
+
+    showView("auth");
+
+    updateHeaderNav();
+
+    showToast(
+        "You have been logged out.",
+        "success"
+    );
+};
+
+
+/* =========================================================
+   HEADER
+   ========================================================= */
+
+function updateHeaderNav() {
+
+    const userLabel =
+        document.getElementById("header-user");
+
+    if (!userLabel) return;
+
+    if (!appState.currentUser) {
+
+        userLabel.textContent = "";
+
+        return;
+    }
+
+    userLabel.textContent =
+        appState.currentUser.role === "admin"
+            ? "ADMIN"
+            : appState.currentUser.name;
+}
+
+
+/* =========================================================
+   RIDER GPS
+   ========================================================= */
+
+function startRiderGPS() {
+
+    if (!navigator.geolocation) {
+
+        showToast(
+            "This phone does not support GPS.",
+            "error"
+        );
+
+        return;
+    }
+
+    if (gpsWatchId !== null) {
+        navigator.geolocation.clearWatch(gpsWatchId);
+    }
+
+    gpsWatchId =
+        navigator.geolocation.watchPosition(
+            async position => {
+
+                const lat =
+                    position.coords.latitude;
+
+                const lng =
+                    position.coords.longitude;
+
+                if (!supabaseUser) return;
+
+                const {
+                    error
+                } = await supabase
+                    .from("riders")
+                    .update({
+                        lat,
+                        lng,
+                        last_seen:
+                            new Date().toISOString(),
+                        status: "Active Shift"
+                    })
+                    .eq("id", supabaseUser.id);
+
+                if (error) {
+                    console.error(
+                        "GPS update error:",
+                        error
+                    );
+                }
+
+                updateRiderGPSDisplay(
+                    lat,
+                    lng
+                );
+            },
+
+            error => {
+
+                console.error(
+                    "GPS permission/error:",
+                    error
+                );
+
+                let message =
+                    "GPS unavailable.";
+
+                if (error.code === 1) {
+                    message =
+                        "GPS permission denied. Please allow location access.";
+                }
+
+                if (error.code === 2) {
+                    message =
+                        "Your location could not be determined.";
+                }
+
+                if (error.code === 3) {
+                    message =
+                        "GPS request timed out.";
+                }
+
+                showToast(
+                    message,
+                    "error"
+                );
+            },
+
+            {
+                enableHighAccuracy: true,
+                maximumAge: 5000,
+                timeout: 15000
+            }
+        );
+}
+
+
+function updateRiderGPSDisplay(lat, lng) {
+
+    const latElement =
+        document.getElementById("gps-lat");
+
+    const lngElement =
+        document.getElementById("gps-lng");
+
+    if (latElement) {
+        latElement.textContent =
+            Number(lat).toFixed(6);
+    }
+
+    if (lngElement) {
+        lngElement.textContent =
+            Number(lng).toFixed(6);
+    }
+}
+
+
+/* =========================================================
+   ADMIN RIDER SELECTION
+   ========================================================= */
+
+window.selectAdminRider = async function (riderId) {
+
+    if (appState.currentUser?.role !== "admin") {
+        return;
+    }
+
+    const rider =
+        appState.ridersOnline.find(
+            item => item.id === riderId
+        );
+
+    if (!rider) {
+        showToast(
+            "Rider could not be found.",
+            "error"
+        );
+        return;
+    }
+
+    appState.selectedRiderId = rider.id;
+    appState.selectedRiderName = rider.name;
+
+    await subscribeToMessages(rider.id);
+
+    refreshUI();
+
+    showToast(
+        `Chat connected to ${rider.name}.`,
+        "success"
+    );
+};
+
+
+/* =========================================================
+   MESSAGES
+   ========================================================= */
+
+async function subscribeToMessages(riderId) {
+
+    if (messagesChannel) {
+        await supabase.removeChannel(messagesChannel);
+        messagesChannel = null;
+    }
+
+    appState.chatMessages = [];
+
+    const {
+        data,
+        error
+    } = await supabase
+        .from("messages")
+        .select("*")
+        .eq("rider_id", riderId)
+        .order("created_at", {
+            ascending: true
+        });
+
+    if (error) {
+
+        console.error(
+            "Load messages error:",
+            error
+        );
+
+        showToast(
+            "Unable to load chat messages.",
+            "error"
+        );
+
+    } else {
+
+        appState.chatMessages = data || [];
+    }
+
+    refreshUI();
+
+    messagesChannel =
+        supabase
+            .channel(
+                "badia-messages-" +
+                riderId +
+                "-" +
+                Date.now()
+            )
+            .on(
+                "postgres_changes",
+                {
+                    event: "INSERT",
+                    schema: "public",
+                    table: "messages",
+                    filter:
+                        `rider_id=eq.${riderId}`
+                },
+                payload => {
+
+                    const message =
+                        payload.new;
+
+                    const exists =
+                        appState.chatMessages.some(
+                            item =>
+                                item.id === message.id
+                        );
+
+                    if (!exists) {
+
+                        appState.chatMessages.push(
+                            message
+                        );
+                    }
+
+                    refreshUI();
+                }
+            )
+            .subscribe();
+}
+
+
+/* =========================================================
+   SEND MESSAGE
+   ========================================================= */
+
+async function insertMessage(messageData) {
+
+    const {
+        data,
+        error
+    } = await supabase
+        .from("messages")
+        .insert(messageData)
+        .select()
+        .single();
+
+    if (error) {
+
+        console.error(
+            "Message insert error:",
+            error
+        );
+
+        showToast(
+            "Message failed: " + error.message,
+            "error"
+        );
+
+        return null;
+    }
+
+    if (data) {
+
+        const exists =
+            appState.chatMessages.some(
+                item => item.id === data.id
+            );
+
+        if (!exists) {
+            appState.chatMessages.push(data);
+        }
+
+        refreshUI();
+    }
+
+    return data;
+}
+
+
+window.sendRiderMessage = async function () {
+
+    if (
+        !appState.currentUser ||
+        appState.currentUser.role !== "rider"
+    ) {
+        return;
+    }
+
+    const input =
+        document.getElementById(
+            "rider-chat-input"
+        );
+
+    const text =
+        input?.value.trim();
+
+    if (!text) return;
+
+    if (!supabaseUser) {
+        showToast(
+            "Cloud connection unavailable.",
+            "error"
+        );
+        return;
+    }
+
+    const message =
+        await insertMessage({
+            rider_id: supabaseUser.id,
+
+            sender_id: supabaseUser.id,
+
+            sender_role: "rider",
+
+            sender_name:
+                appState.currentUser.name,
+
+            text,
+
+            type: "text",
+
+            audio_url: null
+        });
+
+    if (message && input) {
+        input.value = "";
+    }
+};
+
+
+window.sendAdminMessage = async function () {
+
+    if (
+        !appState.currentUser ||
+        appState.currentUser.role !== "admin"
+    ) {
+        return;
+    }
+
+    if (!appState.selectedRiderId) {
+
+        showToast(
+            "Select a rider before sending a message.",
+            "error"
+        );
+
+        return;
+    }
+
+    const input =
+        document.getElementById(
+            "admin-chat-input"
+        );
+
+    const text =
+        input?.value.trim();
+
+    if (!text) return;
+
+    const message =
+        await insertMessage({
+            rider_id:
+                appState.selectedRiderId,
+
+            sender_id:
+                supabaseUser?.id || null,
+
+            sender_role: "admin",
+
+            sender_name: "Dispatch Admin",
+
+            text,
+
+            type: "text",
+
+            audio_url: null
+        });
+
+    if (message && input) {
+        input.value = "";
+    }
+};
+
+
+/* =========================================================
+   RENDER CHAT
+   ========================================================= */
+
+function renderChatMessages() {
+
+    const riderContainer =
+        document.getElementById(
+            "rider-chat-messages"
+        );
+
+    const adminContainer =
+        document.getElementById(
+            "admin-chat-messages"
+        );
+
+
+    /* -------------------------
+       RIDER CHAT
+       ------------------------- */
+
+    if (riderContainer) {
+
+        if (
+            !appState.currentUser ||
+            appState.currentUser.role !== "rider"
+        ) {
+
+            riderContainer.innerHTML =
+                `<div class="text-center text-slate-400 text-sm py-10">
+                    Login as a rider to start chatting with Dispatch.
+                </div>`;
+
+        } else if (appState.chatMessages.length === 0) {
+
+            riderContainer.innerHTML =
+                `<div class="text-center text-slate-400 text-sm py-10">
+                    No messages yet.<br>
+                    Send a message to Dispatch Admin.
+                </div>`;
+
+        } else {
+
+            riderContainer.innerHTML =
+                appState.chatMessages
+                    .map(renderSingleMessage)
+                    .join("");
+
+            riderContainer.scrollTop =
+                riderContainer.scrollHeight;
+        }
+    }
+
+
+    /* -------------------------
+       ADMIN CHAT
+       ------------------------- */
+
+    if (adminContainer) {
+
+        if (!appState.selectedRiderId) {
+
+            adminContainer.innerHTML =
+                `<div class="text-center text-slate-400 text-sm py-10">
+                    Select a rider from the fleet to start a private chat.
+                </div>`;
+
+        } else if (appState.chatMessages.length === 0) {
+
+            adminContainer.innerHTML =
+                `<div class="text-center text-slate-400 text-sm py-10">
+                    No messages from ${escapeHtml(appState.selectedRiderName)} yet.
+                </div>`;
+
+        } else {
+
+            adminContainer.innerHTML =
+                appState.chatMessages
+                    .map(renderSingleMessage)
+                    .join("");
+
+            adminContainer.scrollTop =
+                adminContainer.scrollHeight;
+        }
+    }
+
+    updateAdminChatHeader();
+}
+
+
+function renderSingleMessage(message) {
+
+    const isMe =
+        message.sender_id &&
+        supabaseUser &&
+        message.sender_id === supabaseUser.id;
+
+    const isAdmin =
+        message.sender_role === "admin";
+
+    const alignment =
+        isMe
+            ? "justify-end"
+            : "justify-start";
+
+    const bubble =
+        isMe
+            ? "bg-amber-500 text-slate-950"
+            : "bg-slate-700 text-white";
+
+    let body = "";
+
+    if (
+        message.type === "audio" &&
+        message.audio_url
+    ) {
+
+        const encoded =
+            encodeURIComponent(
+                message.audio_url
+            );
+
+        body =
+            `<button
+                type="button"
+                onclick="playAudioMessage(decodeURIComponent('${encoded}'))"
+                class="flex items-center gap-3 px-4 py-2 rounded-lg bg-black/20 hover:bg-black/30"
+            >
+                <i class="fa-solid fa-play"></i>
+                <span>Voice Message</span>
+            </button>`;
+
+    } else {
+
+        body =
+            `<div class="whitespace-pre-wrap break-words">
+                ${escapeHtml(message.text)}
+            </div>`;
+    }
+
+    return `
+        <div class="flex ${alignment} mb-3">
+            <div class="max-w-[82%]">
+                <div class="text-[9px] uppercase tracking-wide text-slate-400 mb-1 px-1">
+                    ${escapeHtml(message.sender_name || (isAdmin ? "Admin" : "Rider"))}
+                </div>
+
+                <div class="${bubble} rounded-2xl px-4 py-2 text-sm shadow">
+                    ${body}
+                </div>
+
+                <div class="text-[9px] text-slate-500 mt-1 px-1">
+                    ${formatMessageTime(message.created_at)}
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+
+window.playAudioMessage = function (url) {
+
+    if (!url) return;
+
+    const audio =
+        new Audio(url);
+
+    audio.play().catch(error => {
+
+        console.error(
+            "Audio playback error:",
+            error
+        );
+
+        showToast(
+            "Unable to play the voice message.",
+            "error"
+        );
+    });
+};
+
+
+/* =========================================================
+   VOICE / WALKIE-TALKIE
+   ========================================================= */
+
+window.startPTTRecording = async function () {
+
+    if (isRecordingPTT) return;
+
+    if (
+        !appState.currentUser ||
+        appState.currentUser.role !== "rider"
+    ) {
+        showToast(
+            "Only a logged-in rider can use Walkie-Talkie.",
+            "error"
+        );
+        return;
+    }
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+
+        showToast(
+            "This phone does not support microphone recording.",
+            "error"
+        );
+
+        return;
+    }
+
+    try {
+
+        const stream =
+            await navigator.mediaDevices.getUserMedia({
+                audio: true
+            });
+
+        audioChunks = [];
+
+        let mimeType =
+            "audio/webm;codecs=opus";
+
+        if (
+            !MediaRecorder.isTypeSupported(
+                mimeType
+            )
+        ) {
+            mimeType = "audio/webm";
+        }
+
+        mediaRecorder =
+            new MediaRecorder(
+                stream,
+                {
+                    mimeType
+                }
+            );
+
+        mediaRecorder.ondataavailable =
+            event => {
+
+                if (event.data.size > 0) {
+                    audioChunks.push(
+                        event.data
+                    );
+                }
+            };
+
+        mediaRecorder.onstop =
+            async () => {
+
+                const blob =
+                    new Blob(
+                        audioChunks,
+                        {
+                            type:
+                                mimeType
+                        }
+                    );
+
+                stream
+                    .getTracks()
+                    .forEach(
+                        track =>
+                            track.stop()
+                    );
+
+                isRecordingPTT = false;
+
+                await uploadVoiceMessage(
+                    blob
+                );
+
+                mediaRecorder = null;
+            };
+
+        mediaRecorder.start();
+
+        isRecordingPTT = true;
+
+        updatePTTButton(true);
+
+        showToast(
+            "Recording... release the button to send.",
+            "success"
+        );
+
+    } catch (error) {
+
+        console.error(
+            "Microphone error:",
+            error
+        );
+
+        showToast(
+            "Microphone permission was denied or unavailable.",
+            "error"
+        );
+
+        isRecordingPTT = false;
+    }
+};
+
+
+window.stopPTTRecording = function () {
+
+    if (
+        !isRecordingPTT ||
+        !mediaRecorder
+    ) {
+        return;
+    }
+
+    if (
+        mediaRecorder.state !== "inactive"
+    ) {
+        mediaRecorder.stop();
+    }
+
+    updatePTTButton(false);
+};
+
+
+function updatePTTButton(recording) {
+
+    const buttons =
+        document.querySelectorAll(
+            "[data-ptt-button]"
+        );
+
+    buttons.forEach(button => {
+
+        if (recording) {
+
+            button.classList.add(
+                "bg-red-600",
+                "animate-pulse"
+            );
+
+            button.classList.remove(
+                "bg-amber-500"
+            );
+
+            const text =
+                button.querySelector(
+                    "[data-ptt-text]"
+                );
+
+            if (text) {
+                text.textContent =
+                    "RECORDING...";
+            }
+
+        } else {
+
+            button.classList.remove(
+                "bg-red-600",
+                "animate-pulse"
+            );
+
+            button.classList.add(
+                "bg-amber-500"
+            );
+
+            const text =
+                button.querySelector(
+                    "[data-ptt-text]"
+                );
+
+            if (text) {
+                text.textContent =
+                    "HOLD TO TALK";
+            }
+        }
+    });
+}
+
+
+async function uploadVoiceMessage(blob) {
+
+    if (!supabaseUser) {
+        showToast(
+            "Cloud connection unavailable.",
+            "error"
+        );
+        return;
+    }
+
+    const riderId =
+        supabaseUser.id;
+
+    const filePath =
+        riderId +
+        "/" +
+        Date.now() +
+        "-" +
+        createId() +
+        ".webm";
+
+    showToast(
+        "Uploading voice message..."
+    );
+
+    const {
+        error: uploadError
+    } = await supabase
+        .storage
+        .from("voice-messages")
+        .upload(
+            filePath,
+            blob,
+            {
+                contentType:
+                    blob.type ||
+                    "audio/webm",
+                upsert: false
+            }
+        );
+
+    if (uploadError) {
+
+        console.error(
+            "Voice upload error:",
+            uploadError
+        );
+
+        showToast(
+            "Voice upload failed: " +
+            uploadError.message,
+            "error"
+        );
+
+        return;
+    }
+
+    const {
+        data
+    } = supabase
+        .storage
+        .from("voice-messages")
+        .getPublicUrl(filePath);
+
+    const publicUrl =
+        data?.publicUrl;
+
+    if (!publicUrl) {
+
+        showToast(
+            "Voice file uploaded but no public URL was returned.",
+            "error"
+        );
+
+        return;
+    }
+
+    await insertMessage({
+        rider_id: riderId,
+
+        sender_id: riderId,
+
+        sender_role: "rider",
+
+        sender_name:
+            appState.currentUser.name,
+
+        text: "🎤 Voice Walkie-Talkie Clip",
+
+        type: "audio",
+
+        audio_url: publicUrl
+    });
+
+    showToast(
+        "Voice message sent to Dispatch.",
+        "success"
+    );
+}
+
+
+/* =========================================================
+   ADMIN TTS / DISPATCH
+   ========================================================= */
+
+window.generateAndPlayTTSDispatch =
+    async function () {
+
+        if (
+            !appState.currentUser ||
+            appState.currentUser.role !== "admin"
+        ) {
+            return;
+        }
+
+        if (!appState.selectedRiderId) {
+
+            showToast(
+                "Select a rider before sending a dispatch.",
+                "error"
+            );
+
+            return;
+        }
+
+        const input =
+            document.getElementById(
+                "tts-prompt"
+            );
+
+        const text =
+            input?.value.trim();
+
+        if (!text) {
+
+            showToast(
+                "Enter a dispatch message first.",
+                "error"
+            );
+
+            return;
+        }
+
+
+        /* Local browser speech */
+
+        if (
+            "speechSynthesis" in window
+        ) {
+
+            window.speechSynthesis.cancel();
+
+            const utterance =
+                new SpeechSynthesisUtterance(
+                    text
+                );
+
+            utterance.lang = "en-US";
+
+            utterance.rate = 1;
+            utterance.pitch = 1;
+
+            window.speechSynthesis.speak(
+                utterance
+            );
+        }
+
+
+        /* Send the dispatch through Supabase */
+
+        await insertMessage({
+            rider_id:
+                appState.selectedRiderId,
+
+            sender_id:
+                supabaseUser?.id || null,
+
+            sender_role: "admin",
+
+            sender_name: "Dispatch Admin",
+
+            text:
+                "🔊 VOICE DISPATCH: " +
+                text,
+
+            type: "text",
+
+            audio_url: null
+        });
+
+        showToast(
+            `Dispatch sent to ${appState.selectedRiderName}.`,
+            "success"
+        );
+    };
+
+
+/* =========================================================
+   ORDERS
+   ========================================================= */
+
+window.handleCreateOrder =
+    async function () {
+
+        const customerInput =
+            document.getElementById(
+                "order-customer"
+            );
+
+        const qtyInput =
+            document.getElementById(
+                "order-qty"
+            );
+
+        const riderInput =
+            document.getElementById(
+                "order-rider"
+            );
+
+        const customer =
+            customerInput?.value.trim();
+
+        const qty =
+            qtyInput?.value.trim();
+
+        const rider =
+            riderInput?.value.trim();
+
+        if (
+            !customer ||
+            !qty ||
+            !rider
+        ) {
+
+            showToast(
+                "Complete the customer, quantity and rider fields.",
+                "error"
+            );
+
+            return;
+        }
+
+        const orderId =
+            "ORD-" +
+            Date.now()
+                .toString()
+                .slice(-6);
+
+        const orderData = {
+
+            id: orderId,
+
+            customer,
+
+            qty,
+
+            rider,
+
+            time:
+                new Date()
+                    .toLocaleTimeString(
+                        [],
+                        {
+                            hour: "2-digit",
+                            minute: "2-digit"
+                        }
+                    ),
+
+            status: "Dispatched"
+        };
+
+        const {
+            data,
+            error
+        } = await supabase
+            .from("orders")
+            .insert(orderData)
+            .select()
+            .single();
+
+        if (error) {
+
+            console.error(
+                "Create order error:",
+                error
+            );
+
+            showToast(
+                "Order creation failed: " +
+                error.message,
+                "error"
+            );
+
+            return;
+        }
+
+        if (data) {
+
+            const newOrder =
+                mapOrder(data);
+
+            const exists =
+                appState.orders.some(
+                    order =>
+                        order.id === newOrder.id
+                );
+
+            if (!exists) {
+                appState.orders.unshift(
+                    newOrder
+                );
+            }
+        }
+
+
+        /* If the rider name matches a registered rider,
+           automatically send the order notification
+           to that rider's private chat. */
+
+        const assignedRider =
+            appState.ridersOnline.find(
+                item =>
+                    item.name.toLowerCase() ===
+                    rider.toLowerCase()
+            );
+
+        if (assignedRider) {
+
+            await insertMessage({
+                rider_id:
+                    assignedRider.id,
+
+                sender_id:
+                    supabaseUser?.id || null,
+
+                sender_role: "admin",
+
+                sender_name: "Dispatch Admin",
+
+                text:
+                    `📦 NEW ORDER\n` +
+                    `Customer: ${customer}\n` +
+                    `Quantity: ${qty}\n` +
+                    `Order: ${orderId}`,
+
+                type: "text",
+
+                audio_url: null
+            });
+        }
+
+        if (customerInput) {
+            customerInput.value = "";
+        }
+
+        if (qtyInput) {
+            qtyInput.value = "";
+        }
+
+        showToast(
+            "Order dispatched successfully.",
+            "success"
+        );
+
+        refreshUI();
+    };
+
+
+/* =========================================================
+   ADMIN FLEET
+   ========================================================= */
+
+function renderAdminFleet() {
+
+    const container =
+        document.getElementById(
+            "admin-fleet-list"
+        );
+
+    if (!container) return;
+
+    if (appState.ridersOnline.length === 0) {
+
+        container.innerHTML =
+            `<div class="text-center text-slate-500 py-8 text-sm">
+                No riders registered yet.
+            </div>`;
+
+        return;
+    }
+
+    container.innerHTML =
+        appState.ridersOnline
+            .map(rider => {
+
+                const selected =
+                    appState.selectedRiderId ===
+                    rider.id;
+
+                const hasGPS =
+                    Number.isFinite(
+                        Number(rider.lat)
+                    ) &&
+                    Number.isFinite(
+                        Number(rider.lng)
+                    );
+
+                return `
+                    <div class="bg-slate-800/80 border ${
+                        selected
+                            ? "border-amber-500"
+                            : "border-slate-700"
+                    } rounded-xl p-3 mb-2">
+
+                        <div class="flex items-center justify-between gap-3">
+
+                            <div class="min-w-0">
+
+                                <div class="font-semibold text-white truncate">
+                                    ${escapeHtml(rider.name)}
+                                </div>
+
+                                <div class="text-[11px] text-slate-400">
+                                    ${escapeHtml(rider.phone)}
+                                </div>
+
+                                <div class="text-[10px] mt-1 ${
+                                    rider.status === "Active Shift"
+                                        ? "text-green-400"
+                                        : "text-slate-500"
+                                }">
+                                    ${escapeHtml(rider.status)}
+                                    ${
+                                        hasGPS
+                                            ? " • GPS LIVE"
+                                            : " • GPS OFF"
+                                    }
+                                </div>
+
+                            </div>
+
+                            <button
+                                type="button"
+                                onclick="selectAdminRider('${escapeJs(rider.id)}')"
+                                class="${
+                                    selected
+                                        ? "bg-amber-500 text-slate-950"
+                                        : "bg-slate-700 text-white"
+                                } px-3 py-2 rounded-lg text-xs font-bold whitespace-nowrap"
+                            >
+                                <i class="fa-solid fa-comments mr-1"></i>
+                                ${
+                                    selected
+                                        ? "CHAT OPEN"
+                                        : "CHAT"
+                                }
+                            </button>
+
+                        </div>
+
+                    </div>
+                `;
+            })
+            .join("");
+}
+
+
+/* =========================================================
+   ADMIN CHAT HEADER
+   ========================================================= */
+
+function updateAdminChatHeader() {
+
+    const messages =
+        document.getElementById(
+            "admin-chat-messages"
+        );
+
+    if (!messages) return;
+
+    const header =
+        messages.previousElementSibling;
+
+    if (!header) return;
+
+    const titleArea =
+        header.firstElementChild;
+
+    if (!titleArea) return;
+
+    let label =
+        document.getElementById(
+            "admin-selected-rider"
+        );
+
+    if (!label) {
+
+        label =
+            document.createElement("span");
+
+        label.id =
+            "admin-selected-rider";
+
+        label.className =
+            "block text-[10px] text-amber-400 font-semibold mt-1";
+
+        titleArea.appendChild(label);
+    }
+
+    if (appState.selectedRiderId) {
+
+        label.textContent =
+            "Private chat: " +
+            appState.selectedRiderName;
+
+    } else {
+
+        label.textContent =
+            "Select a rider to chat";
+    }
+}
+
+
+/* =========================================================
+   ADMIN ORDERS
+   ========================================================= */
+
+function renderAdminOrders() {
+
+    const container =
+        document.getElementById(
+            "admin-orders-list"
+        );
+
+    if (!container) return;
+
+    if (appState.orders.length === 0) {
+
+        container.innerHTML =
+            `<div class="text-center text-slate-500 py-8 text-sm">
+                No orders dispatched yet.
+            </div>`;
+
+        return;
+    }
+
+    container.innerHTML =
+        appState.orders
+            .map(order => {
+
+                return `
+                    <div class="bg-slate-800/70 border border-slate-700 rounded-xl p-3 mb-2">
+
+                        <div class="flex justify-between gap-3">
+
+                            <div>
+
+                                <div class="font-semibold text-white">
+                                    ${escapeHtml(order.customer)}
+                                </div>
+
+                                <div class="text-xs text-slate-400">
+                                    Qty: ${escapeHtml(order.qty)}
+                                </div>
+
+                                <div class="text-xs text-amber-400">
+                                    Rider: ${escapeHtml(order.rider)}
+                                </div>
+
+                            </div>
+
+                            <div class="text-right">
+
+                                <div class="text-[10px] text-slate-500">
+                                    ${escapeHtml(order.id)}
+                                </div>
+
+                                <div class="text-[10px] text-slate-400">
+                                    ${escapeHtml(order.time)}
+                                </div>
+
+                                <div class="text-[10px] text-green-400 mt-1">
+                                    ${escapeHtml(order.status)}
+                                </div>
+
+                            </div>
+
+                        </div>
+
+                    </div>
+                `;
+            })
+            .join("");
+}
+
+
+/* =========================================================
+   LEAFLET MAP
+   ========================================================= */
+
+function initLeafletMap() {
+
+    const mapElement =
+        document.getElementById(
+            "fleet-map"
+        );
+
+    if (!mapElement) return;
+
+    if (leafletMap) {
+
+        setTimeout(() => {
+            leafletMap.invalidateSize();
+        }, 300);
+
+        updateLeafletMarkers();
+
+        return;
+    }
+
+    if (!window.L) {
+
+        console.warn(
+            "Leaflet is not available."
+        );
+
+        return;
+    }
+
+    leafletMap =
+        L.map(
+            mapElement
+        ).setView(
+            [5.6037, -0.1870],
+            12
+        );
+
+    L.tileLayer(
+        "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+        {
+            maxZoom: 19,
+            attribution:
+                "&copy; OpenStreetMap contributors"
+        }
+    ).addTo(
+        leafletMap
+    );
+
+    updateLeafletMarkers();
+
+    setTimeout(() => {
+        leafletMap.invalidateSize();
+    }, 500);
+}
+
+
+function updateLeafletMarkers() {
+
+    if (!leafletMap) return;
+
+    const currentIds =
+        new Set();
+
+    appState.ridersOnline
+        .forEach(rider => {
+
+            const lat =
+                Number(rider.lat);
+
+            const lng =
+                Number(rider.lng);
+
+            if (
+                !Number.isFinite(lat) ||
+                !Number.isFinite(lng)
+            ) {
+                return;
+            }
+
+            currentIds.add(rider.id);
+
+            const popup =
+                `<strong>${escapeHtml(rider.name)}</strong><br>` +
+                `${escapeHtml(rider.phone)}<br>` +
+                `<span style="font-size:11px">` +
+                `${escapeHtml(rider.status)}` +
+                `</span>`;
+
+            if (leafletMarkers[rider.id]) {
+
+                leafletMarkers[rider.id]
+                    .setLatLng([
+                        lat,
+                        lng
+                    ])
+                    .setPopupContent(
+                        popup
+                    );
+
+            } else {
+
+                leafletMarkers[rider.id] =
+                    L.marker([
+                        lat,
+                        lng
+                    ])
+                    .addTo(
+                        leafletMap
+                    )
+                    .bindPopup(
+                        popup
+                    );
+            }
+        });
+
+
+    Object.keys(
+        leafletMarkers
+    ).forEach(id => {
+
+        if (!currentIds.has(id)) {
+
+            leafletMap.removeLayer(
+                leafletMarkers[id]
+            );
+
+            delete leafletMarkers[id];
+        }
+    });
+}
+
+
+/* =========================================================
+   RIDER TABS
+   ========================================================= */
+
+window.switchRiderTab =
+    function (tabName) {
+
+        appState.activeRiderTab =
+            tabName;
+
+        const tabs = [
+            "gps",
+            "chat",
+            "walkie"
+        ];
+
+        tabs.forEach(tab => {
+
+            const section =
+                document.getElementById(
+                    `rider-tab-${tab}`
+                );
+
+            if (section) {
+
+                section.classList.toggle(
+                    "hidden",
+                    tab !== tabName
+                );
+            }
+        });
+
+        refreshUI();
+    };
+
+
+/* =========================================================
+   AUTH TABS
+   ========================================================= */
+
+window.switchAuthMode =
+    function (mode) {
+
+        appState.authMode =
+            mode;
+
+        const riderPanel =
+            document.getElementById(
+                "rider-login-panel"
+            );
+
+        const adminPanel =
+            document.getElementById(
+                "admin-login-panel"
+            );
+
+        if (riderPanel) {
+            riderPanel.classList.toggle(
+                "hidden",
+                mode !== "rider"
+            );
+        }
+
+        if (adminPanel) {
+            adminPanel.classList.toggle(
+                "hidden",
+                mode !== "admin"
+            );
+        }
+    };
+
+
+/* =========================================================
+   REFRESH UI
+   ========================================================= */
+
+function refreshUI() {
+
+    renderAdminFleet();
+
+    renderAdminOrders();
+
+    renderChatMessages();
+
+    updateAdminChatHeader();
+
+    updateLeafletMarkers();
+}
+
+
+/* =========================================================
+   CLOCK
+   ========================================================= */
+
+function startClock() {
+
+    const clock =
+        document.getElementById(
+            "live-clock"
+        );
+
+    if (!clock) return;
+
+    function update() {
+
+        const now =
+            new Date();
+
+        clock.textContent =
+            now.toLocaleTimeString(
+                [],
+                {
+                    hour: "2-digit",
+                    minute: "2-digit",
+                    second: "2-digit"
+                }
+            );
+    }
+
+    update();
+
+    setInterval(
+        update,
+        1000
+    );
+}
+
+
+/* =========================================================
+   KEYBOARD ENTER SUPPORT
+   ========================================================= */
+
+document.addEventListener(
+    "keydown",
+    event => {
+
+        if (
+            event.key !== "Enter" ||
+            event.shiftKey
+        ) {
+            return;
+        }
+
+        const target =
+            event.target;
+
+        if (
+            target?.id ===
+            "rider-chat-input"
+        ) {
+
+            event.preventDefault();
+
+            window.sendRiderMessage();
+        }
+
+        if (
+            target?.id ===
+            "admin-chat-input"
+        ) {
+
+            event.preventDefault();
+
+            window.sendAdminMessage();
+        }
+    }
+);
+
+
+/* =========================================================
+   INITIALIZE APPLICATION
+   ========================================================= */
+
+window.addEventListener(
+    "load",
+    async () => {
+
+        updateHeaderNav();
+
+        startClock();
+
+        try {
+
+            await initSupabase();
+
+            setSyncBadge(
+                true,
+                "Supabase connected"
+            );
+
+            subscribeToRiders();
+
+            subscribeToOrders();
+
+            await loadRiders();
+
+            await loadOrders();
+
+            refreshUI();
+
+        } catch (error) {
+
+            console.error(
+                "Application initialization error:",
+                error
+            );
+
+            setSyncBadge(
+                false,
+                "Cloud connection failed"
+            );
+
+            showToast(
+                error.message ||
+                "Unable to connect to Supabase.",
+                "error"
+            );
+        }
+    }
+);
+
+</script>
